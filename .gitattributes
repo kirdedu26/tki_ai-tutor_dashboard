@@ -1,0 +1,5 @@
+# 저장소는 LF로 보관하고 작업 파일도 LF로 유지한다(윈도 CRLF 변환 방지)
+* text=auto eol=lf
+
+# 폰트는 바이너리
+*.woff2 binary

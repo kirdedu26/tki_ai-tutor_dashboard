@@ -1,0 +1,3 @@
+# 이 저장소는 publish_dashboard.py가 생성한다. 직접 고치지 말 것.
+.vercel
+.env*
