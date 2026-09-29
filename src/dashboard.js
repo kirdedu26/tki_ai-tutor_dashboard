@@ -319,7 +319,7 @@
       '<span class="s">· 교수자 대시보드</span></div>' +
       '<div class="dash-actions">' +
       (meta ? '<span class="dmeta">' + meta + '</span>' : '') +
-      '<button class="dbtn" id="csvbtn" title="완료 세션 원본 데이터를 결정 단위 CSV로 내려받기">↓ CSV 내보내기</button>' +
+      '<button class="dbtn" id="csvbtn" title="원본 데이터를 엑셀 피벗용 CSV로 내려받기 (결정 하나가 한 행 · 미완료 세션 포함)">↓ CSV 내보내기</button>' +
       '<button class="dbtn" id="refresh">새로고침</button>' +
       '<button class="dbtn danger" id="resetbtn" title="수집된 모든 결과 삭제(테스트 데이터 정리) — 되돌릴 수 없음">데이터 초기화</button></div>' +
       '</div>' +
@@ -353,24 +353,31 @@
 
   // 시작 이벤트와 완료 결과를 분리하고 id로 중복 제거해 완료율을 계산한다.
   function splitRecords(records) {
-    var startedSet = {}, completedMap = {}, completedNoId = [];
+    var startedSet = {}, startRec = {}, completedMap = {}, completedNoId = [];
     records.forEach(function (r) {
       if (!r || typeof r !== "object") return;
       var hasPractices = Array.isArray(r.practices) && r.practices.length > 0;
       if (r.id) startedSet[r.id] = true;
       if (hasPractices) {
         if (r.id) completedMap[r.id] = r; else completedNoId.push(r);
+      } else if (r.id && !startRec[r.id]) {
+        startRec[r.id] = r; // 시작 신호 — 완료 세션의 소요 시간 계산과 CSV 미완료 행의 원본
       }
     });
     var completed = Object.keys(completedMap).map(function (k) { return completedMap[k]; }).concat(completedNoId);
     return {
       completed: completed,
+      startRec: startRec,
+      // 시작만 하고 종합 화면까지 가지 않은 세션. 화면 집계에는 쓰지 않고 CSV에만 한 행씩 남긴다.
+      incomplete: Object.keys(startRec).filter(function (k) { return !completedMap[k]; })
+        .map(function (k) { return startRec[k]; }),
       startedCount: Object.keys(startedSet).length + completedNoId.length,
       completedCount: completed.length,
     };
   }
 
-  var lastCompleted = []; // CSV 내보내기용 (최근 로드된 완료 세션 원본)
+  // CSV 내보내기용 (최근 로드된 원본)
+  var lastCompleted = [], lastIncomplete = [], lastStartRec = {};
 
   function render(records) {
     records = Array.isArray(records) ? records : [];
@@ -380,6 +387,8 @@
     }
     var split = splitRecords(records);
     lastCompleted = split.completed; // CSV 내보내기용
+    lastIncomplete = split.incomplete;
+    lastStartRec = split.startRec;
     if (!split.completed.length) {
       renderEmpty(split.startedCount + "명이 시작했지만, 아직 종합 화면까지 완료한 세션이 없습니다.");
       return;
@@ -489,7 +498,7 @@
         '<td class="num">' + (r.submittedAt ? fmtDate(r.submittedAt) : "—") + '</td></tr>';
     }).join("");
     var sessionsHtml = '<div class="card"><h2>학습자별 선택 현황 (익명)</h2>' +
-      '<p class="desc">완료한 세션마다 무엇을 골랐고 어떻게 끝났는지. 이름·학번 없이 <b>익명 세션 코드</b>로만 표시합니다. (' + sessShown.length + '개 표시 / 총 ' + sess.length + '개) · 우측 상단 &lsquo;CSV 내보내기&rsquo;로 원본을 받을 수 있어요.</p>' +
+      '<p class="desc">완료한 세션마다 무엇을 골랐고 어떻게 끝났는지. 이름·학번 없이 <b>익명 세션 코드</b>로만 표시합니다. (' + sessShown.length + '개 표시 / 총 ' + sess.length + '개) · 우측 상단 &lsquo;CSV 내보내기&rsquo;로 원본을 받을 수 있어요(미완료 세션과 소요 시간도 함께 들어갑니다).</p>' +
       '<div class="tablewrap"><table class="dtab"><thead><tr>' +
       '<th>세션</th><th>직군</th><th>진단 우세</th><th>높음 유형<br><span class="th-sub">상위 25%</span></th><th>낮음 유형<br><span class="th-sub">하위 25%</span></th><th class="num">실습</th><th>주요 대응</th><th>결말</th><th class="num">날짜</th>' +
       '</tr></thead><tbody>' + sessRows + '</tbody></table></div>' +
@@ -636,28 +645,105 @@
     return dk;
   }
 
-  // ── CSV 내보내기 (완료 세션 원본 · 결정 단위, 익명) ──
+  /* ── CSV 내보내기 (익명 · 결정 하나가 한 행 + 미완료 세션 한 행) ──
+     엑셀 피벗을 전제로 만든다.
+
+     · 값은 키가 아니라 사람이 읽는 라벨로 쓴다. 피벗 필드에 그대로 떠야 하기 때문.
+     · 순서가 있는 항목(단계·결말·상황적합·밴드)은 앞에 숫자를 붙인다. 그러지 않으면
+       피벗이 가나다순으로 늘어놓아 '교착'이 맨 앞에 온다.
+     · 세션 정보는 9행, 실습 정보는 3행에 걸쳐 반복된다. 그대로 세면 3배·9배로 부푼다.
+       그래서 '세션첫행'·'실습첫행'을 1/0으로 두었다. 피벗에서 이 열을 '합계'로 끌어다
+       쓰면 중복 제거 없이 세션 수·실습 수가 바로 나온다. */
   function csvCell(v) {
     var s = v == null ? "" : String(v);
     return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
   }
+  // 엑셀이 날짜·시각으로 알아보는 형식. ISO 문자열은 텍스트로 들어가 정렬이 깨진다.
+  function csvTs(iso) {
+    var t = Date.parse(iso);
+    if (isNaN(t)) return "";
+    var d = new Date(t);
+    function p(n) { return (n < 10 ? "0" : "") + n; }
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
+      " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+  }
+  var STAGE_CSV = { 1: "1 쟁점 정의", 2: "2 대응 조정", 3: "3 실행 합의" };
+  var FIT_CSV = { good: "1 잘 맞물림", ok: "2 중립", poor: "3 마찰" };
+  var ENDING_CSV = { resolved: "1 원만히 해결", partial: "2 부분 해결", patched: "3 관계 손상 후 봉합", stuck: "4 교착" };
+  var BAND_CSV = { high: "1 높음", mid: "2 중간", low: "3 낮음" };
+
+  function csvOpt(group, key) { return key ? optLabel(group, key) : ""; }
+
+  // 진단 최고 백분위 유형(동점이면 모두). 화면의 '진단↔행동' 계산과 같은 규칙.
+  function topSetOf(r) {
+    if (!r.scores || r.scoreScale !== "percentile") return null;
+    var mv = Math.max.apply(null, D.order.map(function (k) { return +r.scores[k] || 0; }));
+    var s = {};
+    D.order.forEach(function (k) { if ((+r.scores[k] || 0) === mv) s[k] = true; });
+    return s;
+  }
+
+  // 세션 층위 열(상태 ~ 밴드). 완료·미완료 모두 같은 모양으로 채운다.
+  function csvSessionCols(r, status, startedIso) {
+    var sc = r.scores || {}, pf = r.profile || {};
+    var isPct = r.scoreScale === "percentile";
+    var t0 = Date.parse(startedIso), t1 = Date.parse(r.submittedAt);
+    var mins = (!isNaN(t0) && !isNaN(t1) && t1 >= t0) ? ((t1 - t0) / 60000).toFixed(1) : "";
+    var dom = "";
+    if (isPct) {
+      var tops = Object.keys(topSetOf(r) || {});
+      dom = tops.length === 1 ? typeLabel(tops[0]) : "동점";
+    }
+    return [status, r.id || "", csvTs(startedIso), csvTs(r.submittedAt), mins,
+      isPct ? "백분위" : (r.scores ? "구버전 원점수" : ""),
+      csvOpt("job", pf.job), csvOpt("projectRole", pf.projectRole), csvOpt("opponent", pf.recentOpponent)]
+      .concat(D.order.map(function (k) { var v = +sc[k]; return isNaN(v) ? "" : v; }))
+      .concat([dom])
+      .concat(D.order.map(function (k) {
+        var v = +sc[k]; return (isPct && !isNaN(v)) ? BAND_CSV[bandKey(v)] : "";
+      }));
+  }
+
   function exportCsv() {
-    var recs = lastCompleted || [];
-    if (!recs.length) { alert("내보낼 완료 세션 데이터가 없습니다."); return; }
-    var header = ["session_id", "submitted_at", "score_scale", "job", "project_role", "recent_opponent",
-      "competing", "collaborating", "compromising", "avoiding", "accommodating",
-      "practice_no", "scenario_key", "target", "opponent_type", "ending", "stage", "mode", "fit"];
+    var done = lastCompleted || [], open = lastIncomplete || [];
+    if (!done.length && !open.length) { alert("내보낼 데이터가 없습니다."); return; }
+    var tl = D.order.map(typeLabel);
+    var header = ["상태", "세션", "시작시각", "완료시각", "소요분", "척도", "직군", "과제역할", "최근 갈등상대"]
+      .concat(tl).concat(["우세유형"]).concat(tl.map(function (l) { return "밴드_" + l; }))
+      .concat(["실습번호", "시나리오키", "연습타깃", "상황목표", "난이도", "시작수위", "갈등상대", "결말", "실습소요초"])
+      .concat(["단계", "대응", "상황적합", "우세유형선택", "세션첫행", "실습첫행"]);
     var lines = [header.join(",")];
-    recs.forEach(function (r) {
-      var sc = r.scores || {}, pf = r.profile || {};
-      var base = [r.id || "", r.submittedAt || "", r.scoreScale || "", pf.job || "", pf.projectRole || "", pf.recentOpponent || "",
-        sc.competing, sc.collaborating, sc.compromising, sc.avoiding, sc.accommodating];
+
+    // 완료 세션 — 결정 하나가 한 행
+    done.forEach(function (r) {
+      var base = csvSessionCols(r, "완료", (lastStartRec[r.id] || {}).startedAt || "");
+      var top = topSetOf(r), sessFirst = true;
       (r.practices || []).forEach(function (p, pi) {
-        (p.decisions || []).forEach(function (d) {
-          lines.push(base.concat([pi + 1, p.scenarioKey || "", p.target || "", p.opponentType || "", p.endingKey || "", d.stage, d.mode, d.fit]).map(csvCell).join(","));
+        // 상황목표·난이도·시작수위는 시나리오에 고정된 값. 기록에 없으면 정의에서 가져온다.
+        var def = (D.scenarios && D.scenarios[p.scenarioKey]) || {};
+        var pcols = [pi + 1, p.scenarioKey || "", typeLabel(p.target),
+          p.requires || def.requires || "", def.level || "", p.startState || def.startState || "",
+          csvOpt("opponent", p.opponentType), ENDING_CSV[p.endingKey] || p.endingKey || "",
+          p.durationSec == null ? "" : p.durationSec];
+        var ds = (p.decisions && p.decisions.length) ? p.decisions : [null];
+        var pracFirst = true;
+        ds.forEach(function (d) {
+          var dcols = d
+            ? [STAGE_CSV[d.stage] || d.stage || "", typeLabel(d.mode), FIT_CSV[d.fit] || d.fit || "",
+               top ? (top[d.mode] ? 1 : 0) : ""]
+            : ["", "", "", ""];
+          lines.push(base.concat(pcols, dcols, [sessFirst ? 1 : 0, pracFirst ? 1 : 0]).map(csvCell).join(","));
+          sessFirst = false; pracFirst = false;
         });
       });
     });
+
+    // 미완료 세션 — 한 행. 실습·결정 열은 비운다(완료율의 분모).
+    open.forEach(function (r) {
+      lines.push(csvSessionCols(r, "미완료", r.startedAt || "")
+        .concat(["", "", "", "", "", "", "", "", ""], ["", "", "", ""], [1, 0]).map(csvCell).join(","));
+    });
+
     var csv = "﻿" + lines.join("\r\n"); // BOM: Excel 한글 깨짐 방지
     var blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
     var url = URL.createObjectURL(blob), a = document.createElement("a");
